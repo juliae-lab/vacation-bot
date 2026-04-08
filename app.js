@@ -510,5 +510,5 @@ function formatDate(isoDate) {
   console.log("⚡ Vacation Bot запущен!");
 
   // Раскомментируй при первом запуске — опубликует кнопку в канал
-  // await postVacationButton();
+  await postVacationButton();
 })();
