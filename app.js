@@ -11,8 +11,8 @@ const app = new App({
 });
 
 const VACATION_CHANNEL_ID = process.env.VACATION_CHANNEL_ID;
-const APPS_SCRIPT_URL     = process.env.APPS_SCRIPT_URL;     // URL из Google Apps Script
-const APPS_SCRIPT_TOKEN   = process.env.APPS_SCRIPT_TOKEN;   // секретный токен
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
+const APPS_SCRIPT_TOKEN = process.env.APPS_SCRIPT_TOKEN;
 
 // ─── Запросы к Google Apps Script ────────────────────────────────────────────
 async function sheetsRequest(payload) {
@@ -22,6 +22,12 @@ async function sheetsRequest(payload) {
     body: JSON.stringify({ ...payload, token: APPS_SCRIPT_TOKEN }),
     redirect: "follow",
   });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Apps Script error: ${res.status} ${text}`);
+  }
+
   return res.json();
 }
 
@@ -29,78 +35,94 @@ async function insertRow(data) {
   return sheetsRequest({ action: "insert", ...data });
 }
 
-async function updateStatus(row, approverName, status) {
-  return sheetsRequest({ action: "update_status", row, approverName, status });
-}
-
-async function getDays(row) {
-  const res = await sheetsRequest({ action: "get_days", row });
-  return res.days ?? "?";
+async function updateDecision(row, approverName, status, reason = "") {
+  return sheetsRequest({
+    action: "update_decision",
+    row,
+    approverName,
+    status,
+    reason,
+  });
 }
 
 // ─── Загрузка отделов из файла ────────────────────────────────────────────────
 function loadDepartments() {
   const filePath = path.join(__dirname, "departments.txt");
   const content = fs.readFileSync(filePath, "utf-8");
+
   return content
     .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#"));
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
 }
 
-// ─── Список пользователей воркспейса ─────────────────────────────────────────
-async function getWorkspaceUsers(client) {
-  let users = [];
-  let cursor;
-  do {
-    const res = await client.users.list({ limit: 200, cursor });
-    users = users.concat(
-      res.members.filter((u) => !u.is_bot && !u.deleted && u.id !== "USLACKBOT")
-    );
-    cursor = res.response_metadata?.next_cursor;
-  } while (cursor);
-  return users;
+// ─── Хелперы ─────────────────────────────────────────────────────────────────
+function formatDate(isoDate) {
+  if (!isoDate) return "";
+  const [y, m, d] = isoDate.split("-");
+  return `${d}.${m}.${y}`;
 }
 
-// ─── Опубликовать кнопку в канал (один раз) ──────────────────────────────────
-async function postVacationButton() {
-  await app.client.chat.postMessage({
-    channel: VACATION_CHANNEL_ID,
-    text: "Хочешь в отпуск? Нажми кнопку ниже 👇",
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: "*🏖 Заявка на отпуск / Day-off*\nНажми кнопку, чтобы подать заявку.",
-        },
-      },
-      {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "🌴 Хочу в отпуск", emoji: true },
-            style: "primary",
-            action_id: "open_vacation_modal",
+function calcInclusiveDays(startDate, endDate) {
+  const start = new Date(`${startDate}T00:00:00`);
+  const end = new Date(`${endDate}T00:00:00`);
+  return Math.floor((end - start) / 86400000) + 1;
+}
+
+async function getUserDisplayName(client, userId) {
+  const res = await client.users.info({ user: userId });
+  return res.user?.real_name || res.user?.profile?.real_name || res.user?.name || userId;
+}
+
+async function getSlackPermalink(client, channel, ts) {
+  const res = await client.chat.getPermalink({ channel, message_ts: ts });
+  return res.permalink;
+}
+
+async function publishHome(userId, client) {
+  await client.views.publish({
+    user_id: userId,
+    view: {
+      type: "home",
+      blocks: [
+        {
+          type: "header",
+          text: {
+            type: "plain_text",
+            text: "Заявки на отпуск / Day-off",
+            emoji: true,
           },
-        ],
-      },
-    ],
+        },
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              "Нажмите кнопку ниже, чтобы отправить заявку на *Отпуск* или *Day-off*.",
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              action_id: "open_vacation_modal",
+              text: {
+                type: "plain_text",
+                text: "🌴 Хочу в отпуск",
+                emoji: true,
+              },
+              style: "primary",
+            },
+          ],
+        },
+      ],
+    },
   });
 }
 
-// ─── Открыть модальную форму ──────────────────────────────────────────────────
-app.action("open_vacation_modal", async ({ body, ack, client }) => {
-  await ack();
-
+async function openVacationModal(trigger_id, client) {
   const departments = loadDepartments();
-  const users = await getWorkspaceUsers(client);
-
-  const userOptions = users.map((u) => ({
-    text: { type: "plain_text", text: u.real_name || u.name, emoji: false },
-    value: u.id,
-  }));
 
   const deptOptions = departments.map((d) => ({
     text: { type: "plain_text", text: d, emoji: false },
@@ -108,7 +130,7 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
   }));
 
   await client.views.open({
-    trigger_id: body.trigger_id,
+    trigger_id,
     view: {
       type: "modal",
       callback_id: "vacation_form_submit",
@@ -116,8 +138,7 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
       submit: { type: "plain_text", text: "Отправить" },
       close: { type: "plain_text", text: "Отмена" },
       private_metadata: JSON.stringify({
-        channel: body.channel.id,
-        message_ts: body.message.ts,
+        channel: VACATION_CHANNEL_ID,
       }),
       blocks: [
         {
@@ -127,10 +148,16 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
           element: {
             type: "static_select",
             action_id: "vacation_type",
-            placeholder: { type: "plain_text", text: "Выбери тип" },
+            placeholder: { type: "plain_text", text: "Выберите тип" },
             options: [
-              { text: { type: "plain_text", text: "Отпуск" }, value: "Отпуск" },
-              { text: { type: "plain_text", text: "Day-off" }, value: "Day-off" },
+              {
+                text: { type: "plain_text", text: "Отпуск" },
+                value: "Отпуск",
+              },
+              {
+                text: { type: "plain_text", text: "Day-off" },
+                value: "Day-off",
+              },
             ],
           },
         },
@@ -141,7 +168,7 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
           element: {
             type: "static_select",
             action_id: "department",
-            placeholder: { type: "plain_text", text: "Выбери отдел" },
+            placeholder: { type: "plain_text", text: "Выберите отдел" },
             options: deptOptions,
           },
         },
@@ -150,10 +177,9 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
           block_id: "manager_block",
           label: { type: "plain_text", text: "Ваш согласующий руководитель" },
           element: {
-            type: "static_select",
+            type: "users_select",
             action_id: "manager",
-            placeholder: { type: "plain_text", text: "Выбери руководителя" },
-            options: userOptions,
+            placeholder: { type: "plain_text", text: "Выберите руководителя" },
           },
         },
         {
@@ -163,7 +189,7 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
           element: {
             type: "datepicker",
             action_id: "start_date",
-            placeholder: { type: "plain_text", text: "Выбери дату" },
+            placeholder: { type: "plain_text", text: "Выберите дату" },
           },
         },
         {
@@ -173,7 +199,7 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
           element: {
             type: "datepicker",
             action_id: "end_date",
-            placeholder: { type: "plain_text", text: "Выбери дату" },
+            placeholder: { type: "plain_text", text: "Выберите дату" },
           },
         },
         {
@@ -181,334 +207,424 @@ app.action("open_vacation_modal", async ({ body, ack, client }) => {
           block_id: "vrio_block",
           label: { type: "plain_text", text: "ВРИО на время отсутствия" },
           element: {
-            type: "static_select",
+            type: "users_select",
             action_id: "vrio",
-            placeholder: { type: "plain_text", text: "Выбери сотрудника" },
-            options: userOptions,
+            placeholder: { type: "plain_text", text: "Выберите сотрудника" },
           },
         },
         {
           type: "input",
           block_id: "notify_block",
+          optional: true,
           label: { type: "plain_text", text: "Кого из коллег нужно предупредить" },
           element: {
-            type: "multi_static_select",
+            type: "multi_users_select",
             action_id: "notify_users",
-            placeholder: { type: "plain_text", text: "Выбери коллег" },
-            options: userOptions,
+            placeholder: { type: "plain_text", text: "Выберите коллег" },
           },
         },
       ],
     },
   });
+}
+
+// ─── App Home ────────────────────────────────────────────────────────────────
+app.event("app_home_opened", async ({ event, client, logger }) => {
+  try {
+    await publishHome(event.user, client);
+  } catch (error) {
+    logger.error(error);
+  }
+});
+
+// ─── Открытие модалки ────────────────────────────────────────────────────────
+app.action("open_vacation_modal", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    await openVacationModal(body.trigger_id, client);
+  } catch (error) {
+    logger.error(error);
+  }
 });
 
 // ─── Отправка формы ───────────────────────────────────────────────────────────
-app.view("vacation_form_submit", async ({ ack, body, view, client }) => {
-  await ack();
+app.view("vacation_form_submit", async ({ ack, body, view, client, logger }) => {
+  try {
+    const v = view.state.values;
 
-  const v    = view.state.values;
-  const meta = JSON.parse(view.private_metadata);
+    const vacationType =
+      v.type_block.vacation_type.selected_option.value;
+    const department =
+      v.department_block.department.selected_option.value;
+    const managerId =
+      v.manager_block.manager.selected_user;
+    const startDate =
+      v.start_date_block.start_date.selected_date;
+    const endDate =
+      v.end_date_block.end_date.selected_date;
+    const vrioId =
+      v.vrio_block.vrio.selected_user;
+    const notifyUsers =
+      v.notify_block.notify_users.selected_users || [];
+    const employeeId = body.user.id;
 
-  const vacationType = v.type_block.vacation_type.selected_option.value;
-  const department   = v.department_block.department.selected_option.value;
-  const managerId    = v.manager_block.manager.selected_option.value;
-  const startDate    = v.start_date_block.start_date.selected_date;
-  const endDate      = v.end_date_block.end_date.selected_date;
-  const vrioId       = v.vrio_block.vrio.selected_option.value;
-  const notifyUsers  = v.notify_block.notify_users.selected_options.map((o) => o.value);
-  const employeeId   = body.user.id;
-
-  const [employeeInfo, vrioInfo] = await Promise.all([
-    client.users.info({ user: employeeId }),
-    client.users.info({ user: vrioId }),
-  ]);
-  const employeeName = employeeInfo.user.real_name || employeeInfo.user.name;
-  const vrioName     = vrioInfo.user.real_name     || vrioInfo.user.name;
-
-  const daysCount = Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
-
-  // Публикуем главное сообщение
-  const mainMsg = await client.chat.postMessage({
-    channel: meta.channel,
-    text: `На ${daysCount} дней: с ${formatDate(startDate)} по ${formatDate(endDate)} от ${employeeName} из ${department}`,
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `На *${daysCount} дней*: с *${formatDate(startDate)}* по *${formatDate(endDate)}* от <@${employeeId}> из ${department}`,
+    if (!startDate || !endDate) {
+      await ack({
+        response_action: "errors",
+        errors: {
+          start_date_block: "Укажите дату начала",
+          end_date_block: "Укажите дату окончания",
         },
-      },
-    ],
-  });
+      });
+      return;
+    }
 
-  // Реакция ⏳
-  await client.reactions.add({
-    channel: meta.channel,
-    timestamp: mainMsg.ts,
-    name: "hourglass_flowing_sand",
-  });
-
-  // Ссылка на тред
-  const teamInfo   = await client.team.info();
-  const teamDomain = teamInfo.team.domain;
-  const threadUrl  = `https://${teamDomain}.slack.com/archives/${meta.channel}/p${mainMsg.ts.replace(".", "")}`;
-
-  // Записываем в таблицу
-  const insertResult = await insertRow({
-    threadUrl,
-    employeeName,
-    vacationType,
-    startDate,
-    endDate,
-    vrioName,
-  });
-  const rowNum = insertResult.row;
-
-  // Получаем кол-во дней из таблицы (формула уже посчиталась)
-  await new Promise((r) => setTimeout(r, 1500)); // ждём пересчёт формулы
-  const daysFromSheet = await getDays(rowNum);
-
-  // Тред с деталями и кнопками
-  await client.chat.postMessage({
-    channel: meta.channel,
-    thread_ts: mainMsg.ts,
-    text: "Заявка на согласование",
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text:
-            `*Тип:* ${vacationType}\n` +
-            `*ВРИО:* <@${vrioId}>\n\n` +
-            `<@${managerId}>, прошу согласовать или отклонить заявку, указав причину.`,
+    if (endDate < startDate) {
+      await ack({
+        response_action: "errors",
+        errors: {
+          end_date_block: "Дата окончания не может быть раньше даты начала",
         },
-      },
-      {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "✅ Согласовать", emoji: true },
-            style: "primary",
-            action_id: "approve_vacation",
-            value: JSON.stringify({
-              employeeId,
-              employeeName,
-              managerId,
-              vrioId,
-              vrioName,
-              notifyUsers,
-              startDate,
-              endDate,
-              daysCount: daysFromSheet,
-              mainMsgTs: mainMsg.ts,
-              channel: meta.channel,
-              rowNum,
-            }),
-          },
-          {
-            type: "button",
-            text: { type: "plain_text", text: "❌ Отклонить", emoji: true },
-            style: "danger",
-            action_id: "reject_vacation",
-            value: JSON.stringify({
-              employeeId,
-              managerId,
-              startDate,
-              endDate,
-              mainMsgTs: mainMsg.ts,
-              channel: meta.channel,
-              rowNum,
-            }),
-          },
-        ],
-      },
-    ],
-  });
-});
+      });
+      return;
+    }
 
-// ─── Согласование ─────────────────────────────────────────────────────────────
-app.action("approve_vacation", async ({ ack, body, action, client }) => {
-  await ack();
+    const daysCount = calcInclusiveDays(startDate, endDate);
 
-  const data    = JSON.parse(action.value);
-  const actorId = body.user.id;
+    await ack();
 
-  if (actorId !== data.managerId) {
-    await client.chat.postEphemeral({
-      channel: data.channel,
-      thread_ts: body.message.ts,
-      user: actorId,
-      text: "⚠️ Только руководитель, указанный в заявке, может её согласовать.",
-    });
-    return;
-  }
+    const meta = JSON.parse(view.private_metadata);
+    const channel = meta.channel || VACATION_CHANNEL_ID;
 
-  const actorInfo   = await client.users.info({ user: actorId });
-  const approverName = actorInfo.user.real_name || actorInfo.user.name;
+    const [
+      employeeName,
+      managerName,
+      vrioName,
+    ] = await Promise.all([
+      getUserDisplayName(client, employeeId),
+      getUserDisplayName(client, managerId),
+      getUserDisplayName(client, vrioId),
+    ]);
 
-  await updateStatus(data.rowNum, approverName, "Согласована");
-
-  // Убираем кнопки
-  await client.chat.update({
-    channel: data.channel,
-    ts: body.message.ts,
-    text: "Заявка согласована",
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text:
-            `*Тип:* ${data.vacationType || ""}\n` +
-            `*ВРИО:* <@${data.vrioId}>\n\n` +
-            `<@${actorId}> согласовал(а) заявку ✅`,
-        },
-      },
-    ],
-  });
-
-  // Сообщение об одобрении
-  await client.chat.postMessage({
-    channel: data.channel,
-    thread_ts: body.message.thread_ts || body.message.ts,
-    text: `<@${actorId}> согласовал(а) Ваш отпуск! 🎉`,
-  });
-
-  // Уведомление коллег
-  const notifyMentions = (data.notifyUsers || []).map((uid) => `<@${uid}>`).join(", ");
-  const notifyText =
-    `${notifyMentions ? notifyMentions + ", " : ""}` +
-    `с *${formatDate(data.startDate)}* по *${formatDate(data.endDate)}* ` +
-    `в течение *${data.daysCount} дней* вместо <@${data.employeeId}> ` +
-    `его/её обязанности будет исполнять <@${data.vrioId}>.\n\n` +
-    `<@${data.employeeId}>, отлично вам отдохнуть! 🌴`;
-
-  await client.chat.postMessage({
-    channel: data.channel,
-    thread_ts: body.message.thread_ts || body.message.ts,
-    text: notifyText,
-    blocks: [{ type: "section", text: { type: "mrkdwn", text: notifyText } }],
-  });
-
-  // Меняем реакции
-  try { await client.reactions.remove({ channel: data.channel, timestamp: data.mainMsgTs, name: "hourglass_flowing_sand" }); } catch (_) {}
-  await client.reactions.add({ channel: data.channel, timestamp: data.mainMsgTs, name: "white_check_mark" });
-  await client.reactions.add({ channel: data.channel, timestamp: data.mainMsgTs, name: "palm_tree" });
-});
-
-// ─── Отклонение — шаг 1: открыть модалку с причиной ─────────────────────────
-app.action("reject_vacation", async ({ ack, body, action, client }) => {
-  await ack();
-
-  const data    = JSON.parse(action.value);
-  const actorId = body.user.id;
-
-  if (actorId !== data.managerId && actorId !== data.employeeId) {
-    await client.chat.postEphemeral({
-      channel: data.channel,
-      thread_ts: body.message.ts,
-      user: actorId,
-      text: "⚠️ Отклонить заявку может только руководитель или сам заявитель.",
-    });
-    return;
-  }
-
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: {
-      type: "modal",
-      callback_id: "reject_reason_submit",
-      title: { type: "plain_text", text: "Причина отклонения" },
-      submit: { type: "plain_text", text: "Отправить" },
-      close: { type: "plain_text", text: "Отмена" },
-      private_metadata: JSON.stringify({
-        ...data,
-        actorId,
-        threadTs:    body.message.thread_ts || body.message.ts,
-        buttonMsgTs: body.message.ts,
-      }),
+    // Главное сообщение в канале
+    const mainMsg = await client.chat.postMessage({
+      channel,
+      text: `На ${daysCount} дней: с ${formatDate(startDate)} по ${formatDate(endDate)} от ${employeeName} из ${department}`,
       blocks: [
         {
-          type: "input",
-          block_id: "reason_block",
-          label: { type: "plain_text", text: "Причина отклонения" },
-          element: {
-            type: "plain_text_input",
-            action_id: "reason",
-            multiline: true,
-            placeholder: { type: "plain_text", text: "Укажи причину..." },
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              `На *${daysCount} дней*: с *${formatDate(startDate)}* по *${formatDate(endDate)}* ` +
+              `от <@${employeeId}> из *${department}*`,
           },
         },
       ],
-    },
-  });
+    });
+
+    // Реакция "ждун"
+    await client.reactions.add({
+      channel,
+      timestamp: mainMsg.ts,
+      name: "hourglass_flowing_sand",
+    });
+
+    const threadUrl = await getSlackPermalink(client, channel, mainMsg.ts);
+    const applicationDate = new Date().toISOString().slice(0, 10);
+
+    // Запись в таблицу сразу после submit
+    // Apps Script должен уметь принять эти поля и записать:
+    // Тип, Сотрудник, Отдел, С, По, Кол-во дней, Дата заявки, ВРИО, Статус, Кто согласовал/отклонил, Причина
+    const insertResult = await insertRow({
+      threadUrl,
+      applicationDate,
+      employeeId,
+      employeeName,
+      department,
+      managerId,
+      managerName,
+      vacationType,
+      startDate,
+      endDate,
+      daysCount,
+      vrioId,
+      vrioName,
+      notifyUsers,
+      status: "На рассмотрении",
+      approverName: "",
+      reason: "",
+    });
+
+    const rowNum = insertResult.row;
+
+    // Сообщение в треде с кнопками
+    await client.chat.postMessage({
+      channel,
+      thread_ts: mainMsg.ts,
+      text: "Заявка на согласование",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              `*Тип:* ${vacationType}\n` +
+              `*ВРИО:* <@${vrioId}>\n\n` +
+              `<@${managerId}>, прошу согласовать или отклонить заявку, указав причину.`,
+          },
+        },
+        {
+          type: "actions",
+          block_id: "approval_actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "✅ Согласовать", emoji: true },
+              style: "primary",
+              action_id: "approve_vacation",
+              value: JSON.stringify({
+                rowNum,
+                channel,
+                threadTs: mainMsg.ts,
+                mainMsgTs: mainMsg.ts,
+                employeeId,
+                employeeName,
+                managerId,
+                managerName,
+                vacationType,
+                department,
+                startDate,
+                endDate,
+                daysCount,
+                vrioId,
+                vrioName,
+                notifyUsers,
+              }),
+            },
+            {
+              type: "button",
+              text: { type: "plain_text", text: "❌ Отклонить", emoji: true },
+              style: "danger",
+              action_id: "reject_vacation",
+              value: JSON.stringify({
+                rowNum,
+                channel,
+                threadTs: mainMsg.ts,
+                mainMsgTs: mainMsg.ts,
+                employeeId,
+                employeeName,
+                managerId,
+                managerName,
+                vacationType,
+                department,
+                startDate,
+                endDate,
+                daysCount,
+                vrioId,
+                vrioName,
+                notifyUsers,
+              }),
+            },
+          ],
+        },
+      ],
+    });
+  } catch (error) {
+    logger.error(error);
+  }
 });
 
-// ─── Отклонение — шаг 2: обработать причину ──────────────────────────────────
-app.view("reject_reason_submit", async ({ ack, body, view, client }) => {
+// ─── Согласование ─────────────────────────────────────────────────────────────
+app.action("approve_vacation", async ({ ack, body, action, client, logger }) => {
   await ack();
 
-  const meta    = JSON.parse(view.private_metadata);
-  const reason  = view.state.values.reason_block.reason.value;
-  const actorId = meta.actorId;
+  try {
+    const data = JSON.parse(action.value);
+    const actorId = body.user.id;
 
-  const actorInfo  = await client.users.info({ user: actorId });
-  const actorName  = actorInfo.user.real_name || actorInfo.user.name;
+    if (actorId !== data.managerId) {
+      await client.chat.postEphemeral({
+        channel: data.channel,
+        user: actorId,
+        text: "⚠️ Только руководитель, указанный в заявке, может её согласовать.",
+      });
+      return;
+    }
 
-  await updateStatus(meta.rowNum, actorName, "Отклонена");
+    const approverName = await getUserDisplayName(client, actorId);
 
-  // Убираем кнопки
-  await client.chat.update({
-    channel: meta.channel,
-    ts: meta.buttonMsgTs,
-    text: "Заявка отклонена",
-    blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text: `<@${actorId}> отклонил(а) заявку ❌` },
-      },
-    ],
-  });
+    await updateDecision(data.rowNum, approverName, "Согласована", "");
 
-  // Сообщение об отклонении
-  await client.chat.postMessage({
-    channel: meta.channel,
-    thread_ts: meta.threadTs,
-    text: "Заявка отклонена",
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text:
-            `<@${actorId}> отклонил(а) Ваш запрос! ❌\n\n` +
-            `*Причина:* ${reason}`,
+    // Убираем кнопки, оставляем итоговый статус
+    await client.chat.update({
+      channel: data.channel,
+      ts: body.message.ts,
+      text: "Заявка согласована",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              `*Тип:* ${data.vacationType}\n` +
+              `*ВРИО:* <@${data.vrioId}>\n\n` +
+              `<@${actorId}> согласовал(а) Ваш отпуск! ✅`,
+          },
         },
-      },
-    ],
-  });
+      ],
+    });
 
-  // Меняем реакции
-  try { await client.reactions.remove({ channel: meta.channel, timestamp: meta.mainMsgTs, name: "hourglass_flowing_sand" }); } catch (_) {}
-  await client.reactions.add({ channel: meta.channel, timestamp: meta.mainMsgTs, name: "x" });
+    // Сообщение для коллег
+    const notifyMentions = (data.notifyUsers || [])
+      .map((uid) => `<@${uid}>`)
+      .join(", ");
+
+    const notifyText =
+      `${notifyMentions ? `${notifyMentions}, ` : ""}` +
+      `с *${formatDate(data.startDate)}* по *${formatDate(data.endDate)}* ` +
+      `в течение *${data.daysCount} дней* вместо <@${data.employeeId}> ` +
+      `его/её обязанности будет исполнять <@${data.vrioId}>.\n\n` +
+      `<@${data.employeeId}>, отлично вам отдохнуть! 🌴`;
+
+    await client.chat.postMessage({
+      channel: data.channel,
+      thread_ts: data.threadTs,
+      text: notifyText,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: notifyText },
+        },
+      ],
+    });
+
+    // Меняем реакции
+    try {
+      await client.reactions.remove({
+        channel: data.channel,
+        timestamp: data.mainMsgTs,
+        name: "hourglass_flowing_sand",
+      });
+    } catch (_) {}
+
+    await client.reactions.add({
+      channel: data.channel,
+      timestamp: data.mainMsgTs,
+      name: "white_check_mark",
+    });
+
+    await client.reactions.add({
+      channel: data.channel,
+      timestamp: data.mainMsgTs,
+      name: "palm_tree",
+    });
+  } catch (error) {
+    logger.error(error);
+  }
 });
 
-// ─── Хелпер: форматирование даты ─────────────────────────────────────────────
-function formatDate(isoDate) {
-  if (!isoDate) return "";
-  const [y, m, d] = isoDate.split("-");
-  return `${d}.${m}.${y}`;
-}
+// ─── Отклонение: открытие модалки ────────────────────────────────────────────
+app.action("reject_vacation", async ({ ack, body, action, client, logger }) => {
+  await ack();
+
+  try {
+    const data = JSON.parse(action.value);
+    const actorId = body.user.id;
+
+    if (actorId !== data.managerId && actorId !== data.employeeId) {
+      await client.chat.postEphemeral({
+        channel: data.channel,
+        user: actorId,
+        text: "⚠️ Отклонить заявку может только руководитель или сам заявитель.",
+      });
+      return;
+    }
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        callback_id: "reject_reason_submit",
+        title: { type: "plain_text", text: "Причина отклонения" },
+        submit: { type: "plain_text", text: "Отправить" },
+        close: { type: "plain_text", text: "Отмена" },
+        private_metadata: JSON.stringify({
+          ...data,
+          actorId,
+          buttonMsgTs: body.message.ts,
+        }),
+        blocks: [
+          {
+            type: "input",
+            block_id: "reason_block",
+            label: { type: "plain_text", text: "Причина отклонения" },
+            element: {
+              type: "plain_text_input",
+              action_id: "reason",
+              multiline: true,
+              placeholder: { type: "plain_text", text: "Укажите причину..." },
+            },
+          },
+        ],
+      },
+    });
+  } catch (error) {
+    logger.error(error);
+  }
+});
+
+// ─── Отклонение: submit причины ──────────────────────────────────────────────
+app.view("reject_reason_submit", async ({ ack, view, client, logger }) => {
+  await ack();
+
+  try {
+    const meta = JSON.parse(view.private_metadata);
+    const reason = view.state.values.reason_block.reason.value;
+    const actorId = meta.actorId;
+
+    const actorName = await getUserDisplayName(client, actorId);
+
+    await updateDecision(meta.rowNum, actorName, "Отклонена", reason || "");
+
+    await client.chat.update({
+      channel: meta.channel,
+      ts: meta.buttonMsgTs,
+      text: "Заявка отклонена",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              `<@${actorId}> отклонил(а) Ваш запрос! ❌\n\n` +
+              `*Причина:* ${reason}`,
+          },
+        },
+      ],
+    });
+
+    try {
+      await client.reactions.remove({
+        channel: meta.channel,
+        timestamp: meta.mainMsgTs,
+        name: "hourglass_flowing_sand",
+      });
+    } catch (_) {}
+
+    await client.reactions.add({
+      channel: meta.channel,
+      timestamp: meta.mainMsgTs,
+      name: "x",
+    });
+  } catch (error) {
+    logger.error(error);
+  }
+});
 
 // ─── Запуск ───────────────────────────────────────────────────────────────────
 (async () => {
   await app.start();
   console.log("⚡ Vacation Bot запущен!");
-
-  // Раскомментируй при первом запуске — опубликует кнопку в канал
-  // await postVacationButton();
 })();
