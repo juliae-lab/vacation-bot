@@ -1,11 +1,8 @@
 {
   "name": "vacation-approval-bot",
-  "version": "2.0.0",
-  "description": "Slack bot для согласования отпусков (Google Apps Script вместо Google Cloud)",
+  "version": "3.0.0",
   "main": "app.js",
-  "scripts": {
-    "start": "node app.js"
-  },
+  "scripts": { "start": "node app.js" },
   "dependencies": {
     "@slack/bolt": "^3.17.0"
   }
